@@ -5,7 +5,7 @@ on:
 
 permissions:
   contents: read
-  
+
 env:
   BRANCH: cm-11.0
   DEVICE: i9300
@@ -49,6 +49,8 @@ jobs:
           check LineageOS/android_device_samsung_i9300
           check LineageOS/android_device_samsung_smdk4412-common
           check LineageOS/android_kernel_samsung_smdk4412
+          check LineageOS/android_hardware_samsung
+          check LineageOS/android_packages_apps_SamsungServiceMode
           check TheMuppets/proprietary_vendor_samsung
 
       - name: build the Ubuntu 14.04 build container
@@ -83,9 +85,14 @@ jobs:
             <project name="android_device_samsung_i9300"          path="device/samsung/i9300"          remote="lineage-gh" revision="cm-11.0" />
             <project name="android_device_samsung_smdk4412-common" path="device/samsung/smdk4412-common" remote="lineage-gh" revision="cm-11.0" />
             <project name="android_kernel_samsung_smdk4412"        path="kernel/samsung/smdk4412"        remote="lineage-gh" revision="cm-11.0" />
+            <project name="android_hardware_samsung"               path="hardware/samsung"               remote="lineage-gh" revision="cm-11.0" />
+            <project name="android_packages_apps_SamsungServiceMode" path="packages/apps/SamsungServiceMode" remote="lineage-gh" revision="cm-11.0" />
             <project name="proprietary_vendor_samsung"             path="vendor/samsung"                 remote="muppets-gh" revision="cm-11.0" />
           </manifest>
           EOF
+
+          # Pulls in anything else listed in *.dependencies files
+          # (exit code 10 = "I added something, sync again").
           cat > "$RUNNER_TEMP/resolve_deps.py" <<'EOF'
           import glob, json, os, sys
           import xml.etree.ElementTree as ET
@@ -97,14 +104,20 @@ jobs:
           known = {p.get("path") for p in root.iter("project")}
           added = []
 
-          for dep_file in sorted(glob.glob("device/*/*/cm.dependencies")):
+          for dep_file in sorted(glob.glob("device/*/*/*.dependencies")):
               with open(dep_file) as f:
                   deps = json.load(f)
               for dep in deps:
                   path = dep["target_path"]
+                  name = dep["repository"]
+                  if "/" in name:
+                      org, name = name.split("/", 1)
+                      if org != "LineageOS":
+                          print(f"::warning::skipping {org}/{name}")
+                          continue
                   if path in known or os.path.isdir(path):
                       continue
-                  ET.SubElement(root, "project", name=dep["repository"], path=path,
+                  ET.SubElement(root, "project", name=name, path=path,
                                 remote="lineage-gh", revision=dep.get("branch", BRANCH))
                   known.add(path)
                   added.append(path)
@@ -114,7 +127,7 @@ jobs:
               ET.ElementTree(root).write(OUT, encoding="utf-8", xml_declaration=True)
               print("Added missing dependencies:", *added, sep="\n  ")
               sys.exit(10)
-          print("All cm.dependencies are present.")
+          print("All dependencies are present.")
           EOF
 
           sync_all() {
@@ -135,6 +148,7 @@ jobs:
             sync_all
           done
 
+          ls hardware/samsung/exynos4x12.mk
           df -h /mnt
 
       - name: fetch CM prebuilts
@@ -149,19 +163,8 @@ jobs:
                 echo "::warning::$f is missing, created an empty placeholder"
               fi
             done
-      
-      - name: diagnose
-        run: |
-          cd "$WORK"
-          ls device/samsung/i9300 hardware/samsung
-          grep -rn "exynos4x12" device/samsung/i9300 device/samsung/smdk4412-common || true
-          for d in hardware/samsung device/samsung/i9300 device/samsung/smdk4412-common; do
-            echo "== $d"; git -C $d log -1 --format='%h %ad %s'; git -C $d branch -a
-          done
-          repo manifest -r | grep -E 'hardware/samsung|device/samsung|vendor/samsung'
-     
+
       - name: build the Rom
-        if: false
         run: |
           cat > "$WORK/build-in-container.sh" <<'EOF'
           #!/bin/bash
