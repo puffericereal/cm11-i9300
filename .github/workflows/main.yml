@@ -171,8 +171,12 @@ jobs:
           set -o pipefail
           cd /cm11
           source build/envsetup.sh
-          lunch "cm_${DEVICE}-userdebug" || exit 1
-          [ "$TARGET_PRODUCT" = "cm_${DEVICE}" ] || { echo "lunch did not select cm_${DEVICE}"; exit 1; }
+          PRODUCT=$(sed -n 's/^PRODUCT_NAME *:= *\([A-Za-z0-9_]*\).*/\1/p' device/samsung/${DEVICE}/lineage.mk | head -1)
+          echo "Product name in device tree: $PRODUCT"
+          grep -n PRODUCT_NAME device/samsung/${DEVICE}/*.mk
+          [ -n "$PRODUCT" ] || { echo "could not find PRODUCT_NAME"; exit 1; }
+          lunch "${PRODUCT}-userdebug" || exit 1
+          [ "$TARGET_PRODUCT" = "$PRODUCT" ] || { echo "lunch did not select $PRODUCT"; exit 1; }
           make -j"$(nproc)" bacon 2>&1 | tee build.log
           EOF
           docker run --rm -e DEVICE -v "$WORK":/cm11 cm11-builder bash /cm11/build-in-container.sh
