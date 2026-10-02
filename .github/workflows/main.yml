@@ -184,13 +184,18 @@ jobs:
           EOF
           docker run --rm -e DEVICE -v "$WORK":/cm11 cm11-builder bash /cm11/build-in-container.sh
 
+      - name: show build output
+        run: ls -lh "$WORK/out/target/product/$DEVICE/" | grep -E 'zip|md5' || true
+
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
           name: CM11-I9300-ROM
           path: |
-            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-11-*.zip
-            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-11-*.zip.md5sum
+            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/lineage-*.zip
+            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/lineage-*.zip.md5sum
+            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-*.zip
+            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-*.zip.md5sum
           if-no-files-found: error
 
       - name: upload build log (on failure)
