@@ -149,8 +149,19 @@ jobs:
                 echo "::warning::$f is missing, created an empty placeholder"
               fi
             done
-
+      
+      - name: diagnose
+        run: |
+          cd "$WORK"
+          ls device/samsung/i9300 hardware/samsung
+          grep -rn "exynos4x12" device/samsung/i9300 device/samsung/smdk4412-common || true
+          for d in hardware/samsung device/samsung/i9300 device/samsung/smdk4412-common; do
+            echo "== $d"; git -C $d log -1 --format='%h %ad %s'; git -C $d branch -a
+          done
+          repo manifest -r | grep -E 'hardware/samsung|device/samsung|vendor/samsung'
+     
       - name: build the Rom
+        if: false
         run: |
           cat > "$WORK/build-in-container.sh" <<'EOF'
           #!/bin/bash
