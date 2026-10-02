@@ -1,1 +1,181 @@
+name: Build
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  
+env:
+  BRANCH: cm-11.0
+  DEVICE: i9300
+  WORK: /mnt/cm11
+  GIT_TERMINAL_PROMPT: "0"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: free disk space & prepare work dir
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo mkdir -p "$WORK"
+          sudo chown "$(id -un):$(id -gn)" "$WORK"
+          df -h / /mnt
+
+      - name: config git & install repo
+        run: |
+          git config --global user.name "BuildBot"
+          git config --global user.email "buildbot@example.com"
+          git config --global color.ui false
+          # Some old manifests still use git:// which GitHub switched off in 2022.
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
+
+          sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
+            -o /usr/local/bin/repo
+          sudo chmod a+rx /usr/local/bin/repo
+
+      - name: check if all src repos exist
+        run: |
+          check() {
+            if ! git ls-remote --exit-code --heads "https://github.com/$1" "$BRANCH" >/dev/null 2>&1; then
+              echo "::error::$1 has no '$BRANCH' branch (or the repo is gone)"
+              exit 1
+            fi
+          }
+          check LineageOS/android
+          check LineageOS/android_device_samsung_i9300
+          check LineageOS/android_device_samsung_smdk4412-common
+          check LineageOS/android_kernel_samsung_smdk4412
+          check TheMuppets/proprietary_vendor_samsung
+
+      - name: build the Ubuntu 14.04 build container
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker"
+          cat > "$RUNNER_TEMP/docker/Dockerfile" <<'EOF'
+          FROM ubuntu:14.04
+          ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C
+          ENV PKGS="bc bison build-essential ca-certificates curl flex g++-multilib gcc-multilib git gnupg gperf lib32ncurses5-dev lib32z1-dev libesd0-dev libgl1-mesa-dev libncurses5-dev libsdl1.2-dev libwxgtk2.8-dev libx11-dev libxml2 libxml2-utils lzop openjdk-7-jdk pngcrush python rsync schedtool squashfs-tools unzip x11proto-core-dev xsltproc zip zlib1g-dev"
+          # Trusty is end-of-life: if the main mirror has dropped it, retry via old-releases.
+          RUN set -e; \
+              (apt-get update; apt-get install -y $PKGS) || \
+              (sed -i -E 's#https?://(archive|security)\.ubuntu\.com#http://old-releases.ubuntu.com#g' /etc/apt/sources.list; \
+               apt-get update; apt-get install -y $PKGS); \
+              rm -rf /var/lib/apt/lists/*
+          EOF
+          docker build -t cm11-builder "$RUNNER_TEMP/docker"
+          docker run --rm cm11-builder bash -c 'java -version; python --version; make --version | head -1; gcc --version | head -1'
+
+      - name: sync the CM11 src
+        run: |
+          cd "$WORK"
+          repo init -u https://github.com/LineageOS/android.git -b "$BRANCH" --depth=1
+
+          mkdir -p .repo/local_manifests
+          cat > .repo/local_manifests/i9300.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="lineage-gh" fetch="https://github.com/LineageOS" />
+            <remote name="muppets-gh" fetch="https://github.com/TheMuppets" />
+
+            <project name="android_device_samsung_i9300"          path="device/samsung/i9300"          remote="lineage-gh" revision="cm-11.0" />
+            <project name="android_device_samsung_smdk4412-common" path="device/samsung/smdk4412-common" remote="lineage-gh" revision="cm-11.0" />
+            <project name="android_kernel_samsung_smdk4412"        path="kernel/samsung/smdk4412"        remote="lineage-gh" revision="cm-11.0" />
+            <project name="proprietary_vendor_samsung"             path="vendor/samsung"                 remote="muppets-gh" revision="cm-11.0" />
+          </manifest>
+          EOF
+          cat > "$RUNNER_TEMP/resolve_deps.py" <<'EOF'
+          import glob, json, os, sys
+          import xml.etree.ElementTree as ET
+
+          BRANCH = os.environ["BRANCH"]
+          OUT = ".repo/local_manifests/deps.xml"
+
+          root = ET.parse(OUT).getroot() if os.path.exists(OUT) else ET.Element("manifest")
+          known = {p.get("path") for p in root.iter("project")}
+          added = []
+
+          for dep_file in sorted(glob.glob("device/*/*/cm.dependencies")):
+              with open(dep_file) as f:
+                  deps = json.load(f)
+              for dep in deps:
+                  path = dep["target_path"]
+                  if path in known or os.path.isdir(path):
+                      continue
+                  ET.SubElement(root, "project", name=dep["repository"], path=path,
+                                remote="lineage-gh", revision=dep.get("branch", BRANCH))
+                  known.add(path)
+                  added.append(path)
+
+          if added:
+              ET.indent(root)
+              ET.ElementTree(root).write(OUT, encoding="utf-8", xml_declaration=True)
+              print("Added missing dependencies:", *added, sep="\n  ")
+              sys.exit(10)
+          print("All cm.dependencies are present.")
+          EOF
+
+          sync_all() {
+            for try in 1 2 3; do
+              repo sync -c --no-clone-bundle --no-tags --force-sync -j4 && return 0
+              echo "repo sync failed (try $try of 3), retrying in 30 s..."
+              sleep 30
+            done
+            return 1
+          }
+
+          sync_all
+          for round in 1 2 3 4 5; do
+            rc=0
+            python3 "$RUNNER_TEMP/resolve_deps.py" || rc=$?
+            if [ "$rc" -eq 0 ]; then break; fi
+            if [ "$rc" -ne 10 ]; then exit "$rc"; fi
+            sync_all
+          done
+
+          df -h /mnt
+
+      - name: fetch CM prebuilts
+        run: |
+          cd "$WORK"
+          sh vendor/cm/get-prebuilts || echo "::warning::get-prebuilts failed"
+          { grep -rhoE 'vendor/cm/proprietary/[A-Za-z0-9_./-]*\.[A-Za-z0-9]+' vendor/cm/config || true; } \
+            | sort -u | while read -r f; do
+              if [ ! -d "$f" ] && [ ! -s "$f" ]; then
+                mkdir -p "$(dirname "$f")"
+                : > "$f"
+                echo "::warning::$f is missing, created an empty placeholder"
+              fi
+            done
+
+      - name: build the Rom
+        run: |
+          cat > "$WORK/build-in-container.sh" <<'EOF'
+          #!/bin/bash
+          set -o pipefail
+          cd /cm11
+          source build/envsetup.sh
+          lunch "cm_${DEVICE}-userdebug" || exit 1
+          [ "$TARGET_PRODUCT" = "cm_${DEVICE}" ] || { echo "lunch did not select cm_${DEVICE}"; exit 1; }
+          make -j"$(nproc)" bacon 2>&1 | tee build.log
+          EOF
+          docker run --rm -e DEVICE -v "$WORK":/cm11 cm11-builder bash /cm11/build-in-container.sh
+
+      - name: Upload ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: CM11-I9300-ROM
+          path: |
+            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-11-*.zip
+            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-11-*.zip.md5sum
+          if-no-files-found: error
+
+      - name: upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CM11-I9300-build-log
+          path: ${{ env.WORK }}/build.log
+          if-no-files-found: ignore
