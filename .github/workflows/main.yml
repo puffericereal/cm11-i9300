@@ -59,12 +59,15 @@ jobs:
           cat > "$RUNNER_TEMP/docker/Dockerfile" <<'EOF'
           FROM ubuntu:14.04
           ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C
-          ENV PKGS="bc bison build-essential ca-certificates curl flex g++-multilib gcc-multilib git gnupg gperf lib32ncurses5-dev lib32z1-dev libesd0-dev libgl1-mesa-dev libncurses5-dev libsdl1.2-dev libwxgtk2.8-dev libx11-dev libxml2 libxml2-utils lzop openjdk-7-jdk pngcrush python rsync schedtool squashfs-tools unzip x11proto-core-dev xsltproc zip zlib1g-dev"
+          ENV PKGS="bc bison build-essential ca-certificates curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32z1-dev libesd0-dev libgl1-mesa-dev libncurses5-dev libsdl1.2-dev libwxgtk2.8-dev libx11-dev libxml2 libxml2-utils lzop openjdk-7-jdk pngcrush python rsync schedtool squashfs-tools unzip x11proto-core-dev xsltproc zip zlib1g-dev"
+          # Nice-to-have extras, installed one by one so a missing one can't break anything.
+          ENV EXTRA="autoconf automake bzip2 ccache cmake device-tree-compiler file gawk genisoimage libbz2-dev libc6-dev-i386 libcap-dev libcurl4-openssl-dev libelf-dev liblz4-tool libpng12-dev libssl-dev libtool libxml2-dev lib32stdc++6 mtd-utils openssl optipng patch texinfo u-boot-tools vim-common wget xz-utils"
           # Trusty is end-of-life: if the main mirror has dropped it, retry via old-releases.
           RUN set -e; \
               (apt-get update; apt-get install -y $PKGS) || \
               (sed -i -E 's#https?://(archive|security)\.ubuntu\.com#http://old-releases.ubuntu.com#g' /etc/apt/sources.list; \
                apt-get update; apt-get install -y $PKGS); \
+              for p in $EXTRA; do apt-get install -y $p || echo "skipped $p"; done; \
               rm -rf /var/lib/apt/lists/*
           EOF
           docker build -t cm11-builder "$RUNNER_TEMP/docker"
