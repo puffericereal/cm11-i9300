@@ -1,19 +1,18 @@
-name: Build
+name: Archive CM11 source
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # needed to create the release
 
 env:
   BRANCH: cm-11.0
-  DEVICE: i9300
   WORK: /mnt/cm11
   GIT_TERMINAL_PROMPT: "0"
 
 jobs:
-  build:
+  archive:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -21,8 +20,8 @@ jobs:
       - name: free disk space & prepare work dir
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          sudo mkdir -p "$WORK"
-          sudo chown "$(id -un):$(id -gn)" "$WORK"
+          sudo mkdir -p "$WORK" /mnt/parts
+          sudo chown "$(id -un):$(id -gn)" "$WORK" /mnt/parts
           df -h / /mnt
 
       - name: config git & install repo
@@ -30,48 +29,11 @@ jobs:
           git config --global user.name "BuildBot"
           git config --global user.email "buildbot@example.com"
           git config --global color.ui false
-          # Some old manifests still use git:// which GitHub switched off in 2022.
           git config --global url."https://github.com/".insteadOf "git://github.com/"
 
           sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
             -o /usr/local/bin/repo
           sudo chmod a+rx /usr/local/bin/repo
-
-      - name: check if all src repos exist
-        run: |
-          check() {
-            if ! git ls-remote --exit-code --heads "https://github.com/$1" "$BRANCH" >/dev/null 2>&1; then
-              echo "::error::$1 has no '$BRANCH' branch (or the repo is gone)"
-              exit 1
-            fi
-          }
-          check LineageOS/android
-          check LineageOS/android_device_samsung_i9300
-          check LineageOS/android_device_samsung_smdk4412-common
-          check LineageOS/android_kernel_samsung_smdk4412
-          check LineageOS/android_hardware_samsung
-          check LineageOS/android_packages_apps_SamsungServiceMode
-          check TheMuppets/proprietary_vendor_samsung
-
-      - name: build the Ubuntu 14.04 build container
-        run: |
-          mkdir -p "$RUNNER_TEMP/docker"
-          cat > "$RUNNER_TEMP/docker/Dockerfile" <<'EOF'
-          FROM ubuntu:14.04
-          ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C
-          ENV PKGS="bc bison build-essential ca-certificates curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32z1-dev libesd0-dev libgl1-mesa-dev libncurses5-dev libsdl1.2-dev libwxgtk2.8-dev libx11-dev libxml2 libxml2-utils lzop openjdk-7-jdk pngcrush python rsync schedtool squashfs-tools unzip x11proto-core-dev xsltproc zip zlib1g-dev"
-          # Nice-to-have extras, installed one by one so a missing one can't break anything.
-          ENV EXTRA="autoconf automake bzip2 ccache cmake device-tree-compiler file gawk genisoimage libbz2-dev libc6-dev-i386 libcap-dev libcurl4-openssl-dev libelf-dev liblz4-tool libpng12-dev libssl-dev libtool libxml2-dev lib32stdc++6 mtd-utils openssl optipng patch texinfo u-boot-tools vim-common wget xz-utils"
-          # Trusty is end-of-life: if the main mirror has dropped it, retry via old-releases.
-          RUN set -e; \
-              (apt-get update; apt-get install -y $PKGS) || \
-              (sed -i -E 's#https?://(archive|security)\.ubuntu\.com#http://old-releases.ubuntu.com#g' /etc/apt/sources.list; \
-               apt-get update; apt-get install -y $PKGS); \
-              for p in $EXTRA; do apt-get install -y $p || echo "skipped $p"; done; \
-              rm -rf /var/lib/apt/lists/*
-          EOF
-          docker build -t cm11-builder "$RUNNER_TEMP/docker"
-          docker run --rm cm11-builder bash -c 'java -version; python --version; make --version | head -1; gcc --version | head -1'
 
       - name: sync the CM11 src
         run: |
@@ -94,8 +56,6 @@ jobs:
           </manifest>
           EOF
 
-          # Pulls in anything else listed in *.dependencies files
-          # (exit code 10 = "I added something, sync again").
           cat > "$RUNNER_TEMP/resolve_deps.py" <<'EOF'
           import glob, json, os, sys
           import xml.etree.ElementTree as ET
@@ -167,41 +127,29 @@ jobs:
               fi
             done
 
-      - name: build the Rom
+      - name: pack into release-sized parts
         run: |
-          cat > "$WORK/build-in-container.sh" <<'EOF'
-          #!/bin/bash
-          set -o pipefail
-          cd /cm11
-          source build/envsetup.sh
-          PRODUCT=$(sed -n 's/^PRODUCT_NAME *:= *\([A-Za-z0-9_]*\).*/\1/p' device/samsung/${DEVICE}/lineage.mk | head -1)
-          echo "Product name in device tree: $PRODUCT"
-          grep -n PRODUCT_NAME device/samsung/${DEVICE}/*.mk
-          [ -n "$PRODUCT" ] || { echo "could not find PRODUCT_NAME"; exit 1; }
-          lunch "${PRODUCT}-userdebug" || exit 1
-          [ "$TARGET_PRODUCT" = "$PRODUCT" ] || { echo "lunch did not select $PRODUCT"; exit 1; }
-          make -j"$(nproc)" bacon 2>&1 | tee build.log
-          EOF
-          docker run --rm -e DEVICE -v "$WORK":/cm11 cm11-builder bash /cm11/build-in-container.sh
+          cd "$WORK"
+          # exact commit of every repo, so this snapshot can be rebuilt later
+          repo manifest -r -o /mnt/parts/pinned-manifest.xml
 
-      - name: show build output
-        run: ls -lh "$WORK/out/target/product/$DEVICE/" | grep -E 'zip|md5' || true
+          # whole tree (including .repo) -> tar -> zstd -> pieces under 2 GiB each
+          tar --exclude=./out -cf - . \
+            | zstd -T0 -3 \
+            | split -b 1900M -d -a 3 - /mnt/parts/cm11-src.tar.zst.part-
 
-      - name: Upload ROM
-        uses: actions/upload-artifact@v4
-        with:
-          name: CM11-I9300-ROM
-          path: |
-            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/lineage-*.zip
-            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/lineage-*.zip.md5sum
-            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-*.zip
-            ${{ env.WORK }}/out/target/product/${{ env.DEVICE }}/cm-*.zip.md5sum
-          if-no-files-found: error
+          cd /mnt/parts
+          sha256sum cm11-src.tar.zst.part-* pinned-manifest.xml > SHA256SUMS
+          ls -lh /mnt/parts
+          df -h /mnt
 
-      - name: upload build log (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: CM11-I9300-build-log
-          path: ${{ env.WORK }}/build.log
-          if-no-files-found: ignore
+      - name: publish as a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="cm11-src-$(date +%Y%m%d-%H%M)"
+          gh release create "$TAG" /mnt/parts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CM11 source snapshot $TAG" \
+            --notes "Full CM11 (cm-11.0) i9300 source tree. Join the parts with: cat cm11-src.tar.zst.part-* | zstd -d | tar -x"
+            
